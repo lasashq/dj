@@ -1,0 +1,618 @@
+#!/usr/bin/env bash
+# dj — набор утилит для обработки видео поверх ffmpeg.
+set -euo pipefail
+
+prog=$(basename "$0")
+
+# Видеофайлы, которые берутся из папок.
+VIDEO_EXT_RE='\.(mp4|m4v|mkv|mov|webm|avi|wmv|flv|mts|m2ts|ts)$'
+# Собственные результаты dj — их при обходе папки пропускаем.
+OWN_OUTPUT_RE='\.(compressed|enhanced|test|part)\.[^./]+$'
+
+# Общие опции команд.
+inputs=()     # входные файлы
+output=       # -o: файл (при одном входе) или папка
+overwrite=0   # -y: перезаписывать существующие результаты
+
+die() { echo "$*" >&2; exit 1; }
+
+# Байты → «1.2GB».
+fmt_size() {
+  local n=$(( $1 * 10 )) u=B x
+  for x in KB MB GB TB; do
+    (( n < 10240 )) && break
+    n=$(( n / 1024 )); u=$x
+  done
+  printf '%d.%d%s' $(( n / 10 )) $(( n % 10 )) "$u"
+}
+
+# Секунды → «1:02:03».
+fmt_time() { printf '%d:%02d:%02d' $(( $1 / 3600 )) $(( $1 % 3600 / 60 )) $(( $1 % 60 )); }
+
+duration_of() { ffprobe -v error -show_entries format=duration -of csv=p=0 "$1"; }
+
+ratio() { awk -v a="$1" -v b="$2" 'BEGIN { printf "%.1f", (b > 0 ? a / b : 0) }'; }
+
+usage() {
+  cat >&2 <<EOF
+Использование: $prog <команда> [аргументы]
+
+Команды:
+  extract-audio, ea    извлечь звуковую дорожку (для Adobe Podcast)
+  replace-audio, ra    заменить звуковую дорожку в видео
+  compress-video, cv   пережать видео с более эффективными настройками
+
+Справка по команде: $prog <команда> --help
+EOF
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Запуск ffmpeg с прогрессом
+
+# Рисует прогресс в одну строку по выводу ffmpeg -progress (читает stdin).
+# $1 — ожидаемая длительность результата в секундах (пусто/N/A — неизвестна).
+show_progress() {
+  local dur_ms start=$SECONDS cols k v t=0 size=0 speed=
+  dur_ms=$(awk -v d="${1:-0}" 'BEGIN { printf "%d", d * 1000 }')
+  cols=$(stty size <&2 2>/dev/null | cut -d' ' -f2) || true
+  (( ${cols:-0} > 0 )) || cols=80
+  # На Ctrl+C дочитываем вывод, пока ffmpeg сам не завершится, иначе он ругается на закрытый pipe.
+  trap '' INT
+
+  draw() {
+    local el=$(( SECONDS - start )) line bar='' w
+    if (( dur_ms > 0 )); then
+      (( t > dur_ms )) && t=$dur_ms
+      local eta=--:--:-- est=
+      if (( t > 0 && el > 0 )); then
+        eta=$(fmt_time $(( el * (dur_ms - t) / t )))
+      fi
+      # Прогноз размера: в начале кодировщик ещё копит кадры, так что ждём хотя бы 5%.
+      if (( t * 20 >= dur_ms && t >= 1000 )); then
+        est="  ~$(fmt_size $(( size * (dur_ms / 1000) / (t / 1000) )))"
+      fi
+      # Поля фиксированной ширины, чтобы полоса не прыгала.
+      printf -v line ' %s / %s  %6s  осталось %s%-10s' \
+        "$(fmt_time $(( t / 1000 )))" "$(fmt_time $(( dur_ms / 1000 )))" "$speed" "$eta" "$est"
+      # Полоса занимает свободное место, но не больше 40 символов.
+      w=$(( cols - ${#line} - 7 ))
+      (( w > 40 )) && w=40
+      if (( w >= 10 )); then
+        local fill=$(( w * t / dur_ms ))
+        printf -v bar '%*s' "$fill" ''; bar=${bar// /█}
+        local rest; printf -v rest '%*s' $(( w - fill )) ''; bar+=${rest// /░}
+        bar=" $bar"
+      fi
+      printf -v line '%4d%%%s%s' $(( t * 100 / dur_ms )) "$bar" "$line"
+    else
+      printf -v line ' %s  %s  %s' "$(fmt_time $(( t / 1000 )))" "$speed" "$(fmt_size "$size")"
+    fi
+    printf '\r\033[K%s' "${line:0:cols-1}" >&2
+  }
+
+  while IFS='=' read -r k v; do
+    case $k in
+      out_time_us) [[ $v =~ ^[0-9]+$ ]] && t=$(( v / 1000 )) ;;
+      total_size)  [[ $v =~ ^[0-9]+$ ]] && size=$v ;;
+      speed)       speed=${v// /} ;;
+      progress)    [[ $v == end ]] && (( dur_ms > 0 )) && t=$dur_ms
+                   draw ;;
+    esac
+  done
+  printf '\n' >&2
+}
+
+# Запускает ffmpeg с однострочным прогрессом вместо -stats (тот при узком
+# терминале переносится, и строки идут одна за другой).
+#   ffrun [--log FILE] ДЛИТЕЛЬНОСТЬ аргументы-ffmpeg...
+# С --log сообщения ffmpeg уровня info пишутся в FILE (например, для astats).
+ffrun() {
+  local log='' fd=2 level=error
+  if [[ $1 == --log ]]; then log=$2; shift 2; fi
+  local dur=$1; shift
+  if [[ -n $log ]]; then
+    level=info
+    exec {fd}>"$log"
+  fi
+  local args=(-hide_banner -nostdin -nostats -y -loglevel "$level")
+  # SVT-AV1 пишет свой баннер в stderr в обход -loglevel.
+  export SVT_LOG=${SVT_LOG:-1}
+  if [[ -t 2 ]]; then
+    ffmpeg "${args[@]}" -progress pipe:1 "$@" 2>&$fd | show_progress "$dur"
+  else
+    ffmpeg "${args[@]}" "$@" 2>&$fd
+  fi
+  if [[ -n $log ]]; then exec {fd}>&-; fi
+}
+
+# ---------------------------------------------------------------------------
+# Пакетная обработка
+
+# Путь каждого входа относительно папки, из которой он взят (для файлов — имя).
+# По нему результаты раскладываются в папке из -o, повторяя структуру подпапок.
+declare -A rel_of=()
+
+# Раскрывает аргументы в список файлов (inputs): папки обходятся рекурсивно,
+# из них берутся все видеофайлы (без скрытых файлов и папок и без результатов
+# прошлых запусков dj).
+collect_inputs() {
+  inputs=()
+  local p root f found
+  for p in "$@"; do
+    if [[ -d $p ]]; then
+      root=${p%/}; [[ -z $root ]] && root=/
+      found=0
+      while IFS= read -r -d '' f; do
+        [[ ${f,,} =~ $VIDEO_EXT_RE ]] || continue
+        [[ $f =~ $OWN_OUTPUT_RE ]] && continue
+        inputs+=("$f"); found=1
+        rel_of[$f]=${f#"${root%/}"/}
+      done < <(find "$root" -mindepth 1 -name '.*' -prune -o -type f -print0 | sort -z)
+      (( found )) || echo "В папке нет видеофайлов: $p" >&2
+    elif [[ -f $p ]]; then
+      inputs+=("$p")
+      rel_of[$p]=$(basename "$p")
+    else
+      die "Не найдено: $p"
+    fi
+  done
+  (( ${#inputs[@]} )) || die "Нечего обрабатывать"
+}
+
+# Путь результата для входа $1: рядом с ним или в папке из -o.
+# $2 — хвост имени вместо расширения (например, .compressed.mp4).
+out_path() {
+  local in=$1 tail=$2
+  if [[ -z $output ]]; then
+    echo "${in%.*}$tail"
+  elif [[ -d $output || $output == */ || ${#inputs[@]} -gt 1 ]]; then
+    local rel=${rel_of[$in]:-$(basename "$in")}
+    echo "${output%/}/${rel%.*}$tail"
+  else
+    echo "$output"
+  fi
+}
+
+# Готовит запись результата $1 для входа $2. Если результат уже есть,
+# выходит с кодом 10 (пропуск). Иначе задаёт $part — временный файл,
+# который удаляется при ошибке или прерывании; finish_output переносит его на место.
+cleanup=()
+begin_output() {
+  local out=$1 in=$2
+  [[ $out -ef $in ]] && die "Результат совпадает с исходником: $out"
+  if [[ -e $out && $overwrite == 0 ]]; then
+    echo "Уже есть: $out — пропускаю (-y, чтобы перезаписать)" >&2
+    exit 10
+  fi
+  mkdir -p "$(dirname "$out")"
+  part="${out%.*}.part.${out##*.}"
+  cleanup+=("$part")
+}
+finish_output() { mv -f -- "$part" "$1"; }
+
+# Применяет функцию $1 к каждому файлу из inputs. Каждый файл обрабатывается
+# в подоболочке, чтобы ошибка в одном не останавливала остальные
+# (trap'ы в подоболочке сбрасываются, поэтому ставим их заново).
+run_batch() {
+  local fn=$1 n=${#inputs[@]} i=0 rc ok=0 skipped=0 in
+  local failed=()
+  for in in "${inputs[@]}"; do
+    i=$(( i + 1 ))
+    (( n > 1 )) && printf '\n[%d/%d] %s\n' "$i" "$n" "$in" >&2
+    set +e
+    (
+      set -e
+      trap 'rm -f -- "${cleanup[@]}"' EXIT
+      trap 'exit 130' INT
+      "$fn" "$in"
+    )
+    rc=$?
+    set -e
+    case $rc in
+      0)  ok=$(( ok + 1 )) ;;
+      10) skipped=$(( skipped + 1 )) ;;
+      *)  failed+=("$in") ;;
+    esac
+  done
+
+  if (( n > 1 )); then
+    printf '\nГотово: %d из %d' "$ok" "$n" >&2
+    (( skipped )) && printf ', пропущено: %d' "$skipped" >&2
+    printf '\n' >&2
+  fi
+  if (( ${#failed[@]} )); then
+    printf 'С ошибкой:\n' >&2
+    printf '  %s\n' "${failed[@]}" >&2
+    return 1
+  fi
+}
+
+trap 'printf "\nПрервано\n" >&2; exit 130' INT
+
+# ---------------------------------------------------------------------------
+# extract-audio
+
+usage_extract_audio() {
+  cat >&2 <<EOF
+Извлекает звуковую дорожку из видео для загрузки в Adobe Podcast.
+Стерео с одинаковыми каналами (или с одним пустым каналом) сводится в моно.
+
+Использование:
+  $prog extract-audio [опции] ВИДЕО|ПАПКА...
+
+Опции:
+  --mono          всегда сводить в моно (без анализа)
+  --stereo        всегда оставлять как есть (без анализа)
+  -f, --format F  формат: wav (по умолчанию), flac, mp3, m4a
+  -o, --output P  файл результата (при одном входе) или папка для результатов;
+                  по умолчанию — рядом с видео (video.wav)
+  -y, --overwrite перезаписывать существующие результаты (иначе они пропускаются)
+
+Папки обходятся рекурсивно (скрытые файлы и папки пропускаются).
+С -o в папке результатов повторяется структура подпапок.
+EOF
+  exit 1
+}
+
+cmd_extract_audio() {
+  # Насколько (в дБ) разностный сигнал L-R должен быть тише громкого канала,
+  # чтобы каналы считались одинаковыми.
+  local DUP_THRESHOLD_DB=30
+  # Насколько тише должен быть канал, чтобы считаться пустым.
+  local SILENT_THRESHOLD_DB=40
+
+  local mode=auto fmt=wav args=()
+  while (( $# )); do
+    case $1 in
+      --mono)          mode=mono ;;
+      --stereo)        mode=stereo ;;
+      -f|--format)     fmt=${2:?$1 требует значение}; shift ;;
+      -o|--output)     output=${2:?$1 требует значение}; shift ;;
+      -y|--overwrite)  overwrite=1 ;;
+      -h|--help)       usage_extract_audio ;;
+      --)              shift; args+=("$@"); break ;;
+      -*)              die "Неизвестная опция: $1" ;;
+      *)               args+=("$1") ;;
+    esac
+    shift
+  done
+  (( ${#args[@]} )) || usage_extract_audio
+  collect_inputs "${args[@]}"
+  run_batch extract_one
+}
+
+extract_one() {
+  local in=$1 out
+  out=$(out_path "$in" ".$fmt")
+
+  local audio_codec
+  case "${out##*.}" in
+    wav)  audio_codec=(-c:a pcm_s16le) ;;
+    flac) audio_codec=(-c:a flac -sample_fmt s16) ;;
+    mp3)  audio_codec=(-c:a libmp3lame -b:a 192k) ;;
+    m4a)  audio_codec=(-c:a aac -b:a 192k) ;;
+    *)    die "Неизвестный формат: $out (поддерживаются wav, flac, mp3, m4a)" ;;
+  esac
+
+  local channels
+  channels=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$in")
+  [[ -z "$channels" ]] && die "В файле нет звуковой дорожки: $in"
+
+  begin_output "$out" "$in"
+  local duration
+  duration=$(duration_of "$in")
+
+  # Решаем, что делать с каналами: af — аудиофильтр для итогового файла.
+  local af=anull
+  if [[ "$channels" == 2 && "$mode" != stereo ]]; then
+    if [[ "$mode" == mono ]]; then
+      af="pan=mono|c0=0.5*c0+0.5*c1"
+    else
+      echo "Анализ каналов..." >&2
+      # Один проход: RMS каждого канала и RMS разности L-R.
+      local log stats left right diff decision
+      log=$(mktemp); cleanup+=("$log")
+      ffrun --log "$log" "$duration" -i "$in" -filter_complex \
+        "[0:a:0]asplit=2[a][b];
+         [a]astats=measure_perchannel=RMS_level:measure_overall=none[x];
+         [b]pan=mono|c0=0.5*c0-0.5*c1,astats=measure_perchannel=none:measure_overall=RMS_level[y]" \
+        -map "[x]" -f null - -map "[y]" -f null -
+      stats=$(grep 'RMS level dB' "$log")
+
+      read -r left right diff < <(awk '
+        /Parsed_astats_1/ { ch[++n] = $NF }
+        /Parsed_astats_3/ { d = $NF }
+        END { print ch[1], ch[2], d }' <<<"$stats")
+
+      # -inf (полная тишина) превращаем в -200, чтобы awk мог сравнивать.
+      num() { [[ "$1" == *inf* ]] && echo -200 || echo "$1"; }
+      left=$(num "$left"); right=$(num "$right"); diff=$(num "$diff")
+      printf 'RMS: L=%.1f дБ, R=%.1f дБ, L-R=%.1f дБ\n' "$left" "$right" "$diff" >&2
+
+      decision=$(awk -v l="$left" -v r="$right" -v d="$diff" \
+                     -v dup="$DUP_THRESHOLD_DB" -v sil="$SILENT_THRESHOLD_DB" 'BEGIN {
+        loud = (l > r) ? l : r
+        if (r < l - sil)       print "left"
+        else if (l < r - sil)  print "right"
+        else if (d < loud - dup) print "mono"
+        else                   print "stereo"
+      }')
+
+      case "$decision" in
+        left)   af="pan=mono|c0=c0";               echo "Правый канал пустой → моно из левого" >&2 ;;
+        right)  af="pan=mono|c0=c1";               echo "Левый канал пустой → моно из правого" >&2 ;;
+        mono)   af="pan=mono|c0=0.5*c0+0.5*c1";    echo "Каналы одинаковые → моно" >&2 ;;
+        stereo) echo "Каналы различаются → оставляю стерео" >&2 ;;
+      esac
+    fi
+  fi
+
+  ffrun "$duration" -i "$in" \
+    -map 0:a:0 -vn -sn -dn -map_metadata -1 \
+    -af "$af" "${audio_codec[@]}" "$part"
+  finish_output "$out"
+
+  echo "Готово: $out" >&2
+}
+
+# ---------------------------------------------------------------------------
+# replace-audio
+
+usage_replace_audio() {
+  cat >&2 <<EOF
+Заменяет звуковую дорожку в видео на другую (например, обработанную в Adobe Podcast).
+Видео копируется без перекодирования, звук кодируется в AAC (Opus для .webm).
+
+Использование:
+  $prog replace-audio [-y] video.mp4 audio.wav [output.mp4]
+
+По умолчанию результат пишется в video.enhanced.mp4.
+  -y, --overwrite  перезаписать результат, если он уже есть
+EOF
+  exit 1
+}
+
+cmd_replace_audio() {
+  local args=()
+  while (( $# )); do
+    case $1 in
+      -y|--overwrite)  overwrite=1 ;;
+      -h|--help)       usage_replace_audio ;;
+      --)              shift; args+=("$@"); break ;;
+      -*)              die "Неизвестная опция: $1" ;;
+      *)               args+=("$1") ;;
+    esac
+    shift
+  done
+  [[ ${#args[@]} -lt 2 || ${#args[@]} -gt 3 ]] && usage_replace_audio
+
+  local audio=${args[1]}
+  output=${args[2]:-}
+  [[ -f ${args[0]} ]] || die "Не найдено: ${args[0]}"
+  [[ -f $audio ]] || die "Не найдено: $audio"
+  inputs=("${args[0]}")
+  run_batch replace_one
+}
+
+replace_one() {
+  local video=$1 out
+  out=$(out_path "$video" ".enhanced.${video##*.}")
+  begin_output "$out" "$video"
+
+  # Новая дорожка ставится на ту же временную метку, с которой начиналась старая,
+  # чтобы не съехала синхронизация (в некоторых файлах звук стартует не с нуля).
+  local offset
+  offset=$(ffprobe -v error -select_streams a:0 -show_entries stream=start_time -of csv=p=0 "$video")
+  [[ -z "$offset" || "$offset" == N/A ]] && offset=0
+
+  local audio_codec
+  case "${out##*.}" in
+    webm) audio_codec=(-c:a libopus -b:a 128k) ;;
+    *)    audio_codec=(-c:a aac -b:a 192k) ;;
+  esac
+
+  local extra=()
+  case "${out##*.}" in
+    mp4|m4v|mov) extra=(-movflags +faststart) ;;
+  esac
+
+  ffrun "$(duration_of "$video")" \
+    -i "$video" -itsoffset "$offset" -i "$audio" \
+    -map 0:v -map 1:a:0 -map 0:s? \
+    -map_metadata 0 -map_chapters 0 \
+    -c:v copy -c:s copy "${audio_codec[@]}" "${extra[@]}" \
+    "$part"
+  finish_output "$out"
+
+  echo "Готово: $out" >&2
+}
+
+# ---------------------------------------------------------------------------
+# compress-video
+
+usage_compress_video() {
+  cat >&2 <<EOF
+Пережимает видео более эффективным кодеком и медленным пресетом.
+Подходит для записей с быстрым пресетом кодировщика (OBS, Zoom, экранные записи),
+которые обычно можно уменьшить в несколько раз без видимых потерь.
+Звук копируется как есть, если контейнер это позволяет.
+
+Использование:
+  $prog compress-video [опции] ВИДЕО|ПАПКА...
+
+Опции:
+  --h265          H.265/HEVC, 10 бит (по умолчанию) — хорошее сжатие, играется почти везде
+  --av1           AV1 (SVT-AV1), 10 бит — сжимает лучше и быстрее, но старые устройства не тянут
+  --h264          H.264 — максимальная совместимость, сжатие хуже
+  --crf N         качество: меньше — лучше и больше файл
+                  (по умолчанию: h265 24, av1 32, h264 21; ±6 ≈ размер ×2)
+  --preset P      скорость кодирования: h265/h264 — ultrafast…veryslow (по умолчанию medium/slow),
+                  av1 — 0…13, меньше — медленнее и лучше (по умолчанию 6)
+  --height N      уменьшить разрешение до N строк (например, 720)
+  --fps N         ограничить частоту кадров (для лекций хватает 30, а то и 15)
+  --test [СЕК]    закодировать только фрагмент из середины (по умолчанию 60 с)
+                  и оценить размер итогового файла — удобно подобрать --crf
+  -f, --format F  контейнер: mp4, mkv, mov (по умолчанию — как у исходника, иначе mp4)
+  -o, --output P  файл результата (при одном входе) или папка для результатов;
+                  по умолчанию — рядом с видео (video.compressed.mp4)
+  -y, --overwrite перезаписывать существующие результаты (иначе они пропускаются)
+
+Папки обходятся рекурсивно (скрытые файлы и папки пропускаются).
+С -o в папке результатов повторяется структура подпапок.
+EOF
+  exit 1
+}
+
+cmd_compress_video() {
+  local codec=h265 crf='' preset='' height='' fps='' test_len='' fmt='' args=()
+
+  while (( $# )); do
+    case $1 in
+      --h265)          codec=h265 ;;
+      --av1)           codec=av1 ;;
+      --h264)          codec=h264 ;;
+      --crf)           crf=${2:?$1 требует значение}; shift ;;
+      --preset)        preset=${2:?$1 требует значение}; shift ;;
+      --height)        height=${2:?$1 требует значение}; shift ;;
+      --fps)           fps=${2:?$1 требует значение}; shift ;;
+      --test)
+        test_len=60
+        if [[ "${2:-}" =~ ^[0-9]+$ ]]; then test_len=$2; shift; fi ;;
+      -f|--format)     fmt=${2:?$1 требует значение}; shift ;;
+      -o|--output)     output=${2:?$1 требует значение}; shift ;;
+      -y|--overwrite)  overwrite=1 ;;
+      -h|--help)       usage_compress_video ;;
+      --)              shift; args+=("$@"); break ;;
+      -*)              die "Неизвестная опция: $1" ;;
+      *)               args+=("$1") ;;
+    esac
+    shift
+  done
+  (( ${#args[@]} )) || usage_compress_video
+  [[ -z $fmt || $fmt =~ ^(mp4|mkv|mov)$ ]] || die "Неизвестный формат: $fmt (поддерживаются mp4, mkv, mov)"
+
+  case "$codec" in
+    h265) crf=${crf:-24}; preset=${preset:-medium} ;;
+    av1)  crf=${crf:-32}; preset=${preset:-6} ;;
+    h264) crf=${crf:-21}; preset=${preset:-slow} ;;
+  esac
+
+  local vf=()
+  [[ -n "$height" ]] && vf+=("scale=-2:'min($height,ih)':flags=lanczos")
+  [[ -n "$fps" ]] && vf+=("fps='min($fps,source_fps)'")
+  local vfilter=()
+  if (( ${#vf[@]} )); then
+    vfilter=(-vf "$(IFS=,; echo "${vf[*]}")")
+  fi
+
+  collect_inputs "${args[@]}"
+  printf 'Кодек: %s, CRF %s, пресет %s%s%s\n' "$codec" "$crf" "$preset" \
+    "${height:+, до ${height}p}" "${fps:+, до $fps fps}" >&2
+  run_batch compress_one
+}
+
+compress_one() {
+  local in=$1 ext=${1##*.} out oext
+  ext=${ext,,}
+  [[ $ext =~ ^(mp4|m4v|mkv|mov)$ ]] || ext=mp4
+  out=$(out_path "$in" ".compressed.${fmt:-$ext}")
+  [[ -n $test_len ]] && out="${out%.*}.test.${out##*.}"
+  oext=${out##*.}
+  oext=${oext,,}
+
+  local vcodec
+  case "$codec" in
+    h265)
+      vcodec=(-c:v libx265 -preset "$preset" -crf "$crf"
+              -pix_fmt yuv420p10le -x265-params log-level=error)
+      # Без тега hvc1 HEVC в mp4/mov не открывается в QuickTime/на iOS.
+      [[ "$oext" != mkv ]] && vcodec+=(-tag:v hvc1)
+      ;;
+    av1)
+      vcodec=(-c:v libsvtav1 -preset "$preset" -crf "$crf"
+              -pix_fmt yuv420p10le -svtav1-params tune=0)
+      ;;
+    h264)
+      vcodec=(-c:v libx264 -preset "$preset" -crf "$crf" -pix_fmt yuv420p)
+      ;;
+  esac
+
+  # Звук: копируем, если кодек подходит для контейнера, иначе — AAC (Opus для webm).
+  local acodec_in acodec
+  acodec_in=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 "$in")
+  case "$oext:$acodec_in" in
+    *:)                                     acodec=() ;;
+    mkv:*)                                  acodec=(-c:a copy) ;;
+    webm:opus|webm:vorbis)                  acodec=(-c:a copy) ;;
+    webm:*)                                 acodec=(-c:a libopus -b:a 128k) ;;
+    mov:aac|mov:mp3|mov:alac|mov:ac3|mov:eac3|mov:pcm_*)
+                                            acodec=(-c:a copy) ;;
+    mov:*)                                  acodec=(-c:a aac -b:a 160k) ;;
+    *:aac|*:mp3|*:opus|*:ac3|*:eac3|*:alac|*:flac)
+                                            acodec=(-c:a copy) ;;
+    *)                                      acodec=(-c:a aac -b:a 160k) ;;
+  esac
+
+  # Субтитры и вложения (шрифты) сохраняем только в mkv:
+  # в mp4/mov большинство форматов субтитров как есть не влезает.
+  local maps=(-map 0:v:0 -map 0:a?)
+  [[ "$oext" == mkv ]] && maps+=(-map 0:s? -map 0:t? -c:s copy)
+
+  local extra=()
+  case "$oext" in
+    mp4|m4v|mov) extra=(-movflags +faststart) ;;
+  esac
+
+  # Тестовые фрагменты всегда перезаписываем: их гоняют с разными --crf.
+  [[ -n $test_len ]] && overwrite=1
+  begin_output "$out" "$in"
+
+  local duration enc_dur seek=()
+  duration=$(duration_of "$in")
+  enc_dur=$duration
+  if [[ -n "$test_len" ]]; then
+    local start
+    start=$(awk -v d="$duration" -v l="$test_len" 'BEGIN { s = d/2 - l/2; print (s < 0 ? 0 : s) }')
+    seek=(-ss "$start" -t "$test_len")
+    enc_dur=$(awk -v d="$duration" -v l="$test_len" 'BEGIN { print (l < d ? l : d) }')
+    printf 'Тест: %s с начиная с %s\n' "$test_len" "$(fmt_time "${start%.*}")" >&2
+  fi
+
+  ffrun "$enc_dur" \
+    "${seek[@]}" -i "$in" \
+    "${maps[@]}" -map_metadata 0 -map_chapters 0 \
+    "${vfilter[@]}" "${vcodec[@]}" "${acodec[@]}" "${extra[@]}" \
+    "$part"
+  finish_output "$out"
+
+  local in_size out_size
+  in_size=$(stat -c %s "$in")
+  out_size=$(stat -c %s "$out")
+
+  if [[ -n "$test_len" ]]; then
+    # Прогноз: размер фрагмента, растянутый на всю длительность исходника.
+    local real_len est
+    real_len=$(duration_of "$out")
+    est=$(awk -v s="$out_size" -v l="$real_len" -v d="$duration" 'BEGIN { printf "%d", s * d / l }')
+    printf 'Исходник: %s, прогноз: ~%s (в %s раза меньше)\n' \
+      "$(fmt_size "$in_size")" "$(fmt_size "$est")" "$(ratio "$in_size" "$est")" >&2
+    echo "Фрагмент для сравнения: $out" >&2
+  else
+    printf 'Готово: %s — %s → %s (в %s раза меньше)\n' "$out" \
+      "$(fmt_size "$in_size")" "$(fmt_size "$out_size")" "$(ratio "$in_size" "$out_size")" >&2
+  fi
+}
+
+# ---------------------------------------------------------------------------
+
+[[ $# -lt 1 ]] && usage
+cmd=$1; shift
+
+case "$cmd" in
+  extract-audio|ea)   cmd_extract_audio "$@" ;;
+  replace-audio|ra)   cmd_replace_audio "$@" ;;
+  compress-video|cv)  cmd_compress_video "$@" ;;
+  -h|--help|help)     usage ;;
+  *)                  echo "Неизвестная команда: $cmd" >&2; usage ;;
+esac
