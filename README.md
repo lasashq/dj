@@ -1,18 +1,18 @@
 # dj
 
-Набор утилит для обработки видео поверх ffmpeg.
+A set of video processing helpers on top of ffmpeg.
 
 ```
-dj extract    извлечь звуковую дорожку (например, для Adobe Podcast)
-dj replace    заменить звуковую дорожку в видео
-dj compress   пережать видео с более эффективными настройками
-dj denoise    убрать шум из речи прямо в видео (DPDFNet, локально)
+dj extract    extract the audio track (e.g. for Adobe Podcast)
+dj replace    replace the audio track in a video
+dj compress   re-encode a video with more efficient settings
+dj denoise    remove noise from speech right in the video (DPDFNet, runs locally)
 ```
 
-Команду можно сократить до однозначного начала: `dj c` = `dj compress`, `dj d` = `dj denoise`.
-Справка по команде: `dj <команда> --help`.
+A command can be shortened to any unambiguous prefix: `dj c` = `dj compress`, `dj d` = `dj denoise`.
+Command help: `dj <command> --help`.
 
-## Установка
+## Installation
 
 ### Nix
 
@@ -20,7 +20,7 @@ dj denoise    убрать шум из речи прямо в видео (DPDFNe
 nix run github:s1cklove/dj -- --help
 ```
 
-В NixOS / home-manager:
+In NixOS / home-manager:
 
 ```nix
 inputs.dj = {
@@ -31,23 +31,23 @@ inputs.dj = {
 home.packages = [ inputs.dj.packages.${pkgs.stdenv.hostPlatform.system}.default ];
 ```
 
-Все зависимости, включая модели DPDFNet, подключаются сборкой. В `PATH` их держать не нужно,
-и в рантайме ничего не скачивается.
+All dependencies, including the DPDFNet models, come with the build. They don't need
+to be on `PATH`, and nothing is downloaded at runtime.
 
-### Из клона
+### From a clone
 
 ```sh
 git clone https://github.com/s1cklove/dj ~/code/dj
 ln -s ~/code/dj/dj ~/.local/bin/dj
-sudo apt install ffmpeg gawk          # или аналог для твоего дистрибутива
+sudo apt install ffmpeg gawk          # or the equivalent for your distro
 ```
 
-Для `dj denoise` дополнительно нужен Python-пакет dpdfnet в `.venv` рядом с dj:
+`dj denoise` additionally needs the dpdfnet Python package in a `.venv` next to dj:
 
 ```sh
 python3 -m venv ~/code/dj/.venv
 ~/code/dj/.venv/bin/pip install 'dpdfnet==0.6.*'
 ```
 
-Модель dpdfnet скачает сам при первом запуске (10–15 МБ, в `~/.cache/dpdfnet`).
-Если чего-то не хватает, dj скажет, чего именно.
+dpdfnet downloads the model itself on first run (10–15 MB, into `~/.cache/dpdfnet`).
+If something is missing, dj tells you exactly what.

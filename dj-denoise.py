@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
-"""Шумоподавление DPDFNet для dj: читает моно float32 (f32le) из stdin, пишет в stdout.
+"""DPDFNet noise removal for dj: reads mono float32 (f32le) from stdin, writes to stdout.
 
-Использование: dj-denoise.py МОДЕЛЬ [ПРЕДЕЛ_ДБ]
+Usage: dj-denoise.py MODEL [LIMIT_DB]
 
-Звук должен идти с родной частотой модели (её подставляет dj). Обработка
-потоковая, так что память не растёт с длиной записи.
+Audio must come at the model's native sample rate (dj takes care of that).
+Processing is streamed, so memory doesn't grow with the recording length.
 """
 import sys
 
 import numpy as np
 from dpdfnet import StreamEnhancer
 
-CHUNK = 1 << 16  # сэмплов за одно чтение
+CHUNK = 1 << 16  # samples per read
 
 
 def main():
     model = sys.argv[1]
     limit = float(sys.argv[2]) if len(sys.argv) > 2 else None
-    # Доля исходного сигнала, которая подмешивается к очищенному:
-    # шум ослабляется не больше чем на limit дБ.
+    # Share of the original signal mixed into the cleaned one,
+    # so noise is reduced by at most `limit` dB.
     alpha = 10 ** (-limit / 20) if limit is not None else 0.0
 
     enhancer = StreamEnhancer(model=model)
-    # Поток отстаёт от входа на два окна модели (как и обычный режим dpdfnet,
-    # который эту задержку срезает). Без компенсации звук уедет от видео.
+    # The stream lags the input by two model windows (dpdfnet's offline mode
+    # trims the same delay). Without compensation audio drifts from the video.
     delay = 2 * enhancer._win_len
 
     src, dst = sys.stdin.buffer, sys.stdout.buffer
-    noisy = np.zeros(0, np.float32)  # вход, ещё не сведённый с выходом (для alpha)
-    skip, left = delay, 0  # left — сколько сэмплов ещё можно выдать
+    noisy = np.zeros(0, np.float32)  # input not yet matched with output (for alpha)
+    skip, left = delay, 0  # left — how many samples may still be emitted
 
     def emit(y):
         nonlocal noisy, skip, left
@@ -54,7 +54,7 @@ def main():
             noisy = np.concatenate([noisy, x])
         emit(enhancer.process(x))
 
-    # Досылаем тишину, чтобы вытолкнуть задержанный хвост.
+    # Feed silence to push out the delayed tail.
     emit(enhancer.process(np.zeros(delay + enhancer._win_len, np.float32)))
     emit(enhancer.flush())
     dst.flush()

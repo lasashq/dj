@@ -3,10 +3,10 @@
 let
   dpdfnet = python3Packages.callPackage ./dpdfnet.nix { };
 
-  # Потоковое шумоподавление для dj denoise.
+  # Streaming noise removal for dj denoise.
   dj-denoise = writers.writePython3Bin "dj-denoise" {
     libraries = [ dpdfnet ];
-    # Свой shebang файла становится второй строкой (E265).
+    # The file's own shebang ends up on the second line (E265).
     flakeIgnore = [ "E265" "E501" ];
   } (builtins.readFile ../dj-denoise.py);
 in
@@ -14,7 +14,7 @@ in
 writeShellApplication {
   name = "dj";
   runtimeInputs = [ ffmpeg coreutils gawk findutils gnugrep dj-denoise ];
-  # Модели DPDFNet лежат в store, в рантайме ничего не скачивается.
+  # DPDFNet models live in the store, nothing is downloaded at runtime.
   runtimeEnv.DPDFNET_MODEL_DIR = "${dpdfnet.models}";
   text = builtins.readFile ../dj;
 
