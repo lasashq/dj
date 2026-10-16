@@ -7,7 +7,7 @@ prog=$(basename "$0")
 # Видеофайлы, которые берутся из папок.
 VIDEO_EXT_RE='\.(mp4|m4v|mkv|mov|webm|avi|wmv|flv|mts|m2ts|ts)$'
 # Собственные результаты dj — их при обходе папки пропускаем.
-OWN_OUTPUT_RE='\.(compressed|enhanced|test|part)\.[^./]+$'
+OWN_OUTPUT_RE='\.(compressed|enhanced|denoised|test|part)\.[^./]+$'
 
 # Общие опции команд.
 inputs=()     # входные файлы
@@ -38,11 +38,53 @@ usage() {
 Использование: $prog <команда> [аргументы]
 
 Команды:
-  extract-audio, ea    извлечь звуковую дорожку (для Adobe Podcast)
-  replace-audio, ra    заменить звуковую дорожку в видео
-  compress-video, cv   пережать видео с более эффективными настройками
+  extract    извлечь звуковую дорожку (например, для Adobe Podcast)
+  replace    заменить звуковую дорожку в видео
+  compress   пережать видео с более эффективными настройками
+  denoise    убрать шум из речи прямо в видео (DPDFNet, локально)
 
+Команду можно сократить до однозначного начала: $prog c = $prog compress.
 Справка по команде: $prog <команда> --help
+EOF
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Зависимости
+
+# Папка, где лежит сам dj (в клоне рядом с ним лежат dj-denoise.py и .venv).
+self_dir=$(dirname "$(readlink -f "$0")")
+
+# Проверяет, что нужные программы есть в PATH, и перечисляет недостающие разом.
+require() {
+  local missing=() c
+  for c in "$@"; do
+    command -v "$c" >/dev/null || missing+=("$c")
+  done
+  (( ${#missing[@]} )) || return 0
+  echo "Не хватает: ${missing[*]}" >&2
+  echo "Поставь через пакетный менеджер, например: sudo apt install ffmpeg gawk" >&2
+  exit 1
+}
+
+# Находит, чем запускать шумоподавление, и задаёт denoiser.
+# Под Nix это dj-denoise в PATH, в клоне — dj-denoise.py через python
+# из .venv рядом с dj (или системный python3, если dpdfnet стоит в нём).
+denoiser=()
+require_denoiser() {
+  if command -v dj-denoise >/dev/null; then
+    denoiser=(dj-denoise); return
+  fi
+  local py=python3
+  [[ -x $self_dir/.venv/bin/python ]] && py=$self_dir/.venv/bin/python
+  if [[ -f $self_dir/dj-denoise.py ]] && "$py" -c 'import dpdfnet.stream' 2>/dev/null; then
+    denoiser=("$py" "$self_dir/dj-denoise.py"); return
+  fi
+  cat >&2 <<EOF
+Не хватает: dpdfnet (Python-пакет для шумоподавления)
+Поставь его в .venv рядом с dj:
+  python3 -m venv $self_dir/.venv
+  $self_dir/.venv/bin/pip install 'dpdfnet==0.6.*'
 EOF
   exit 1
 }
@@ -231,15 +273,15 @@ run_batch() {
 trap 'printf "\nПрервано\n" >&2; exit 130' INT
 
 # ---------------------------------------------------------------------------
-# extract-audio
+# extract
 
-usage_extract_audio() {
+usage_extract() {
   cat >&2 <<EOF
 Извлекает звуковую дорожку из видео для загрузки в Adobe Podcast.
 Стерео с одинаковыми каналами (или с одним пустым каналом) сводится в моно.
 
 Использование:
-  $prog extract-audio [опции] ВИДЕО|ПАПКА...
+  $prog extract [опции] ВИДЕО|ПАПКА...
 
 Опции:
   --mono          всегда сводить в моно (без анализа)
@@ -255,13 +297,59 @@ EOF
   exit 1
 }
 
-cmd_extract_audio() {
+# Анализирует стереодорожку файла $1 (длительность $2) и задаёт channel_layout:
+# left/right — второй канал пустой, mono — каналы одинаковые, stereo — различаются.
+channel_layout=
+analyze_channels() {
+  local in=$1 duration=$2
   # Насколько (в дБ) разностный сигнал L-R должен быть тише громкого канала,
   # чтобы каналы считались одинаковыми.
   local DUP_THRESHOLD_DB=30
   # Насколько тише должен быть канал, чтобы считаться пустым.
   local SILENT_THRESHOLD_DB=40
 
+  echo "Анализ каналов..." >&2
+  # Один проход: RMS каждого канала и RMS разности L-R.
+  local log stats left right diff
+  log=$(mktemp); cleanup+=("$log")
+  ffrun --log "$log" "$duration" -i "$in" -filter_complex \
+    "[0:a:0]asplit=2[a][b];
+     [a]astats=measure_perchannel=RMS_level:measure_overall=none[x];
+     [b]pan=mono|c0=0.5*c0-0.5*c1,astats=measure_perchannel=none:measure_overall=RMS_level[y]" \
+    -map "[x]" -f null - -map "[y]" -f null -
+  stats=$(grep 'RMS level dB' "$log")
+
+  read -r left right diff < <(awk '
+    /Parsed_astats_1/ { ch[++n] = $NF }
+    /Parsed_astats_3/ { d = $NF }
+    END { print ch[1], ch[2], d }' <<<"$stats")
+
+  # -inf (полная тишина) превращаем в -200, чтобы awk мог сравнивать.
+  num() { [[ "$1" == *inf* ]] && echo -200 || echo "$1"; }
+  left=$(num "$left"); right=$(num "$right"); diff=$(num "$diff")
+  printf 'RMS: L=%.1f дБ, R=%.1f дБ, L-R=%.1f дБ\n' "$left" "$right" "$diff" >&2
+
+  channel_layout=$(awk -v l="$left" -v r="$right" -v d="$diff" \
+                       -v dup="$DUP_THRESHOLD_DB" -v sil="$SILENT_THRESHOLD_DB" 'BEGIN {
+    loud = (l > r) ? l : r
+    if (r < l - sil)       print "left"
+    else if (l < r - sil)  print "right"
+    else if (d < loud - dup) print "mono"
+    else                   print "stereo"
+  }')
+}
+
+# Фильтр ffmpeg, сводящий стерео в моно по результату analyze_channels ($1).
+mono_filter() {
+  case $1 in
+    left)  echo "Правый канал пустой → моно из левого" >&2; echo "pan=mono|c0=c0" ;;
+    right) echo "Левый канал пустой → моно из правого" >&2; echo "pan=mono|c0=c1" ;;
+    mono)  echo "Каналы одинаковые → моно" >&2;             echo "pan=mono|c0=0.5*c0+0.5*c1" ;;
+    *)     echo "Каналы различаются → свожу в моно" >&2;     echo "pan=mono|c0=0.5*c0+0.5*c1" ;;
+  esac
+}
+
+cmd_extract() {
   local mode=auto fmt=wav args=()
   while (( $# )); do
     case $1 in
@@ -270,14 +358,15 @@ cmd_extract_audio() {
       -f|--format)     fmt=${2:?$1 требует значение}; shift ;;
       -o|--output)     output=${2:?$1 требует значение}; shift ;;
       -y|--overwrite)  overwrite=1 ;;
-      -h|--help)       usage_extract_audio ;;
+      -h|--help)       usage_extract ;;
       --)              shift; args+=("$@"); break ;;
       -*)              die "Неизвестная опция: $1" ;;
       *)               args+=("$1") ;;
     esac
     shift
   done
-  (( ${#args[@]} )) || usage_extract_audio
+  (( ${#args[@]} )) || usage_extract
+  require ffmpeg ffprobe awk
   collect_inputs "${args[@]}"
   run_batch extract_one
 }
@@ -309,41 +398,10 @@ extract_one() {
     if [[ "$mode" == mono ]]; then
       af="pan=mono|c0=0.5*c0+0.5*c1"
     else
-      echo "Анализ каналов..." >&2
-      # Один проход: RMS каждого канала и RMS разности L-R.
-      local log stats left right diff decision
-      log=$(mktemp); cleanup+=("$log")
-      ffrun --log "$log" "$duration" -i "$in" -filter_complex \
-        "[0:a:0]asplit=2[a][b];
-         [a]astats=measure_perchannel=RMS_level:measure_overall=none[x];
-         [b]pan=mono|c0=0.5*c0-0.5*c1,astats=measure_perchannel=none:measure_overall=RMS_level[y]" \
-        -map "[x]" -f null - -map "[y]" -f null -
-      stats=$(grep 'RMS level dB' "$log")
-
-      read -r left right diff < <(awk '
-        /Parsed_astats_1/ { ch[++n] = $NF }
-        /Parsed_astats_3/ { d = $NF }
-        END { print ch[1], ch[2], d }' <<<"$stats")
-
-      # -inf (полная тишина) превращаем в -200, чтобы awk мог сравнивать.
-      num() { [[ "$1" == *inf* ]] && echo -200 || echo "$1"; }
-      left=$(num "$left"); right=$(num "$right"); diff=$(num "$diff")
-      printf 'RMS: L=%.1f дБ, R=%.1f дБ, L-R=%.1f дБ\n' "$left" "$right" "$diff" >&2
-
-      decision=$(awk -v l="$left" -v r="$right" -v d="$diff" \
-                     -v dup="$DUP_THRESHOLD_DB" -v sil="$SILENT_THRESHOLD_DB" 'BEGIN {
-        loud = (l > r) ? l : r
-        if (r < l - sil)       print "left"
-        else if (l < r - sil)  print "right"
-        else if (d < loud - dup) print "mono"
-        else                   print "stereo"
-      }')
-
-      case "$decision" in
-        left)   af="pan=mono|c0=c0";               echo "Правый канал пустой → моно из левого" >&2 ;;
-        right)  af="pan=mono|c0=c1";               echo "Левый канал пустой → моно из правого" >&2 ;;
-        mono)   af="pan=mono|c0=0.5*c0+0.5*c1";    echo "Каналы одинаковые → моно" >&2 ;;
+      analyze_channels "$in" "$duration"
+      case "$channel_layout" in
         stereo) echo "Каналы различаются → оставляю стерео" >&2 ;;
+        *)      af=$(mono_filter "$channel_layout") ;;
       esac
     fi
   fi
@@ -357,15 +415,15 @@ extract_one() {
 }
 
 # ---------------------------------------------------------------------------
-# replace-audio
+# replace
 
-usage_replace_audio() {
+usage_replace() {
   cat >&2 <<EOF
 Заменяет звуковую дорожку в видео на другую (например, обработанную в Adobe Podcast).
 Видео копируется без перекодирования, звук кодируется в AAC (Opus для .webm).
 
 Использование:
-  $prog replace-audio [-y] video.mp4 audio.wav [output.mp4]
+  $prog replace [-y] video.mp4 audio.wav [output.mp4]
 
 По умолчанию результат пишется в video.enhanced.mp4.
   -y, --overwrite  перезаписать результат, если он уже есть
@@ -373,19 +431,20 @@ EOF
   exit 1
 }
 
-cmd_replace_audio() {
+cmd_replace() {
   local args=()
   while (( $# )); do
     case $1 in
       -y|--overwrite)  overwrite=1 ;;
-      -h|--help)       usage_replace_audio ;;
+      -h|--help)       usage_replace ;;
       --)              shift; args+=("$@"); break ;;
       -*)              die "Неизвестная опция: $1" ;;
       *)               args+=("$1") ;;
     esac
     shift
   done
-  [[ ${#args[@]} -lt 2 || ${#args[@]} -gt 3 ]] && usage_replace_audio
+  [[ ${#args[@]} -lt 2 || ${#args[@]} -gt 3 ]] && usage_replace
+  require ffmpeg ffprobe
 
   local audio=${args[1]}
   output=${args[2]:-}
@@ -399,6 +458,17 @@ replace_one() {
   local video=$1 out
   out=$(out_path "$video" ".enhanced.${video##*.}")
   begin_output "$out" "$video"
+  mux_audio "$video" "$out" -i "$audio"
+  finish_output "$out"
+
+  echo "Готово: $out" >&2
+}
+
+# Пишет в $part видео из $1 с новым звуком; $2 — итоговый путь (по нему
+# выбираются кодек и флаги), остальное — опции ffmpeg для входа со звуком.
+# Видео и субтитры копируются как есть.
+mux_audio() {
+  local video=$1 out=$2; shift 2
 
   # Новая дорожка ставится на ту же временную метку, с которой начиналась старая,
   # чтобы не съехала синхронизация (в некоторых файлах звук стартует не с нуля).
@@ -418,20 +488,123 @@ replace_one() {
   esac
 
   ffrun "$(duration_of "$video")" \
-    -i "$video" -itsoffset "$offset" -i "$audio" \
+    -i "$video" -itsoffset "$offset" "$@" \
     -map 0:v -map 1:a:0 -map 0:s? \
     -map_metadata 0 -map_chapters 0 \
     -c:v copy -c:s copy "${audio_codec[@]}" "${extra[@]}" \
     "$part"
+}
+
+# ---------------------------------------------------------------------------
+# denoise
+
+# Модели DPDFNet: имя → родная частота дискретизации.
+declare -A DENOISE_MODELS=(
+  [baseline]=16000 [dpdfnet2]=16000 [dpdfnet4]=16000 [dpdfnet8]=16000
+  [dpdfnet2_8khz]=8000 [dpdfnet8_8khz]=8000
+  [dpdfnet2_48khz_hr]=48000 [dpdfnet8_48khz_hr]=48000
+)
+DENOISE_DEFAULT_MODEL=dpdfnet8_48khz_hr
+
+usage_denoise() {
+  cat >&2 <<EOF
+Убирает шум из речи нейросетью DPDFNet (локально, на CPU) и вставляет
+очищенный звук обратно в видео. Видео копируется без перекодирования.
+Звук сводится в моно (пустой канал отбрасывается, как в extract).
+
+Использование:
+  $prog denoise [опции] ВИДЕО|ЗВУК|ПАПКА...
+
+Опции:
+  --model M       модель (по умолчанию $DENOISE_DEFAULT_MODEL):
+                    dpdfnet8_48khz_hr, dpdfnet2_48khz_hr — полная полоса, 48 кГц;
+                    dpdfnet8 / dpdfnet4 / dpdfnet2 / baseline — 16 кГц, теряют верх;
+                    dpdfnet8_8khz, dpdfnet2_8khz — телефонное качество.
+                  Цифра — размер модели: 8 лучше, 2 примерно в 3 раза быстрее.
+  --limit ДБ      ослаблять шум не больше чем на ДБ дБ — звучит естественнее
+                  (например, 12–20; по умолчанию без ограничения)
+  -o, --output P  файл результата (при одном входе) или папка для результатов;
+                  по умолчанию — рядом с исходником (video.denoised.mp4,
+                  для звука — audio.denoised.wav)
+  -y, --overwrite перезаписывать существующие результаты (иначе они пропускаются)
+
+Папки обходятся рекурсивно (берутся видеофайлы, скрытые пропускаются).
+С -o в папке результатов повторяется структура подпапок.
+EOF
+  exit 1
+}
+
+cmd_denoise() {
+  local model=$DENOISE_DEFAULT_MODEL limit='' args=()
+  while (( $# )); do
+    case $1 in
+      --model)         model=${2:?$1 требует значение}; shift ;;
+      --limit)         limit=${2:?$1 требует значение}; shift ;;
+      -o|--output)     output=${2:?$1 требует значение}; shift ;;
+      -y|--overwrite)  overwrite=1 ;;
+      -h|--help)       usage_denoise ;;
+      --)              shift; args+=("$@"); break ;;
+      -*)              die "Неизвестная опция: $1" ;;
+      *)               args+=("$1") ;;
+    esac
+    shift
+  done
+  (( ${#args[@]} )) || usage_denoise
+  [[ -n ${DENOISE_MODELS[$model]:-} ]] \
+    || die "Неизвестная модель: $model (см. $prog denoise --help)"
+  [[ -z $limit || $limit =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--limit ждёт число дБ: $limit"
+  require ffmpeg ffprobe awk
+  require_denoiser
+
+  local rate=${DENOISE_MODELS[$model]}
+  collect_inputs "${args[@]}"
+  printf 'Модель: %s (%d кГц)%s\n' "$model" $(( rate / 1000 )) "${limit:+, не сильнее $limit дБ}" >&2
+  run_batch denoise_one
+}
+
+denoise_one() {
+  local in=$1 out has_video
+  has_video=$(ffprobe -v error -select_streams V -show_entries stream=index -of csv=p=0 "$in")
+  if [[ -n $has_video ]]; then
+    out=$(out_path "$in" ".denoised.${in##*.}")
+  else
+    out=$(out_path "$in" ".denoised.wav")
+  fi
+
+  local channels
+  channels=$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$in")
+  [[ -z "$channels" ]] && die "В файле нет звуковой дорожки: $in"
+
+  begin_output "$out" "$in"
+  local duration af=anull
+  duration=$(duration_of "$in")
+  # DPDFNet работает с моно, поэтому стерео сводим сами — с учётом пустого канала.
+  if [[ "$channels" == 2 ]]; then
+    analyze_channels "$in" "$duration"
+    af=$(mono_filter "$channel_layout")
+  fi
+
+  # Звук идёт потоком: ffmpeg → нейросеть → ffmpeg, без временных файлов.
+  local raw=(-f f32le -ar "$rate" -ac 1)
+  echo "Шумоподавление..." >&2
+  if [[ -n $has_video ]]; then
+    ffmpeg -hide_banner -nostdin -loglevel error -i "$in" -map 0:a:0 -af "$af" "${raw[@]}" - \
+      | "${denoiser[@]}" "$model" ${limit:+"$limit"} \
+      | mux_audio "$in" "$out" "${raw[@]}" -i pipe:0
+  else
+    ffmpeg -hide_banner -nostdin -loglevel error -i "$in" -map 0:a:0 -af "$af" "${raw[@]}" - \
+      | "${denoiser[@]}" "$model" ${limit:+"$limit"} \
+      | ffrun "$duration" "${raw[@]}" -i pipe:0 -c:a pcm_s16le "$part"
+  fi
   finish_output "$out"
 
   echo "Готово: $out" >&2
 }
 
 # ---------------------------------------------------------------------------
-# compress-video
+# compress
 
-usage_compress_video() {
+usage_compress() {
   cat >&2 <<EOF
 Пережимает видео более эффективным кодеком и медленным пресетом.
 Подходит для записей с быстрым пресетом кодировщика (OBS, Zoom, экранные записи),
@@ -439,7 +612,7 @@ usage_compress_video() {
 Звук копируется как есть, если контейнер это позволяет.
 
 Использование:
-  $prog compress-video [опции] ВИДЕО|ПАПКА...
+  $prog compress [опции] ВИДЕО|ПАПКА...
 
 Опции:
   --h265          H.265/HEVC, 10 бит (по умолчанию) — хорошее сжатие, играется почти везде
@@ -464,7 +637,7 @@ EOF
   exit 1
 }
 
-cmd_compress_video() {
+cmd_compress() {
   local codec=h265 crf='' preset='' height='' fps='' test_len='' fmt='' args=()
 
   while (( $# )); do
@@ -482,15 +655,16 @@ cmd_compress_video() {
       -f|--format)     fmt=${2:?$1 требует значение}; shift ;;
       -o|--output)     output=${2:?$1 требует значение}; shift ;;
       -y|--overwrite)  overwrite=1 ;;
-      -h|--help)       usage_compress_video ;;
+      -h|--help)       usage_compress ;;
       --)              shift; args+=("$@"); break ;;
       -*)              die "Неизвестная опция: $1" ;;
       *)               args+=("$1") ;;
     esac
     shift
   done
-  (( ${#args[@]} )) || usage_compress_video
+  (( ${#args[@]} )) || usage_compress
   [[ -z $fmt || $fmt =~ ^(mp4|mkv|mov)$ ]] || die "Неизвестный формат: $fmt (поддерживаются mp4, mkv, mov)"
+  require ffmpeg ffprobe awk
 
   case "$codec" in
     h265) crf=${crf:-24}; preset=${preset:-medium} ;;
@@ -610,9 +784,19 @@ compress_one() {
 cmd=$1; shift
 
 case "$cmd" in
-  extract-audio|ea)   cmd_extract_audio "$@" ;;
-  replace-audio|ra)   cmd_replace_audio "$@" ;;
-  compress-video|cv)  cmd_compress_video "$@" ;;
-  -h|--help|help)     usage ;;
-  *)                  echo "Неизвестная команда: $cmd" >&2; usage ;;
+  -h|--help|help) usage ;;
+  -*)             echo "Неизвестная команда: $cmd" >&2; usage ;;
+esac
+
+# Команда — полное имя или его однозначное начало (dj c → compress).
+commands=(extract replace compress denoise)
+matches=()
+for c in "${commands[@]}"; do
+  if [[ $c == "$cmd" ]]; then matches=("$c"); break; fi
+  [[ $c == "$cmd"* ]] && matches+=("$c")
+done
+case ${#matches[@]} in
+  0) echo "Неизвестная команда: $cmd" >&2; usage ;;
+  1) "cmd_${matches[0]}" "$@" ;;
+  *) die "Неоднозначная команда: $cmd — ${matches[*]}" ;;
 esac
